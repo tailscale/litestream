@@ -165,7 +165,7 @@ The commands are:
 
 // Config represents a configuration file for the litestream daemon.
 type Config struct {
-	// Bind address for serving metrics.
+	// Bind address for serving HTTP endpoint.
 	Addr string `yaml:"addr"`
 
 	// List of databases to manage.

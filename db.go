@@ -251,7 +251,7 @@ func (db *DB) invalidatePos(ctx context.Context) error {
 	// Determine generation based off "generation" file in meta directory.
 	generation, err := db.CurrentGeneration()
 	if err != nil {
-		return err
+		return fmt.Errorf("current generation: %w", err)
 	} else if generation == "" {
 		return nil
 	}
@@ -259,7 +259,7 @@ func (db *DB) invalidatePos(ctx context.Context) error {
 	// Iterate over all segments to find the last one.
 	itr, err := db.WALSegments(context.Background(), generation)
 	if err != nil {
-		return err
+		return fmt.Errorf("wal segments: %w", err)
 	}
 	defer itr.Close()
 
@@ -269,7 +269,7 @@ func (db *DB) invalidatePos(ctx context.Context) error {
 		pos = info.Pos()
 	}
 	if err := itr.Close(); err != nil {
-		return err
+		return fmt.Errorf("wal segment iterator: %w", err)
 	}
 
 	// Exit if no WAL segments exist.
@@ -286,7 +286,7 @@ func (db *DB) invalidatePos(ctx context.Context) error {
 
 	n, err := io.Copy(ioutil.Discard, lz4.NewReader(rd))
 	if err != nil {
-		return err
+		return fmt.Errorf("copy wal: %w", err)
 	}
 	pos.Offset += n
 
@@ -1281,42 +1281,22 @@ func (db *DB) writeWALSegment(ctx context.Context, pos Pos, rd io.Reader) error 
 
 // WALSegments returns an iterator over all available WAL files for a generation.
 func (db *DB) WALSegments(ctx context.Context, generation string) (WALSegmentIterator, error) {
-	ents, err := os.ReadDir(db.ShadowWALDir(generation))
-	if os.IsNotExist(err) {
-		return NewWALSegmentInfoSliceIterator(nil), nil
-	} else if err != nil {
-		return nil, err
-	}
-
-	// Iterate over every file and convert to metadata.
-	indexes := make([]int, 0, len(ents))
-	for _, ent := range ents {
-		index, err := ParseIndex(ent.Name())
-		if err != nil {
-			continue
-		}
-		indexes = append(indexes, index)
-	}
-
-	sort.Ints(indexes)
-
-	return newShadowWALSegmentIterator(db, generation, indexes), nil
+	return newShadowWALSegmentIterator(db, generation), nil
 }
 
 type shadowWALSegmentIterator struct {
 	db         *DB
 	generation string
-	indexes    []int
+	pos        Pos // last seen position
 
 	infos []WALSegmentInfo
 	err   error
 }
 
-func newShadowWALSegmentIterator(db *DB, generation string, indexes []int) *shadowWALSegmentIterator {
+func newShadowWALSegmentIterator(db *DB, generation string) *shadowWALSegmentIterator {
 	return &shadowWALSegmentIterator{
 		db:         db,
 		generation: generation,
-		indexes:    indexes,
 	}
 }
 
@@ -1330,64 +1310,102 @@ func (itr *shadowWALSegmentIterator) Next() bool {
 		return false
 	}
 
-	for {
-		// Move to the next segment in cache, if available.
-		if len(itr.infos) > 1 {
-			itr.infos = itr.infos[1:]
-			return true
-		}
-		itr.infos = itr.infos[:0] // otherwise clear infos
+	// Move to the next segment in cache, if available.
+	if len(itr.infos) > 0 {
+		itr.infos = itr.infos[1:]
+	}
 
-		// If no indexes remain, stop iteration.
-		if len(itr.indexes) == 0 {
-			return false
-		}
+	// If more cached segments are available, return immediately.
+	if len(itr.infos) > 0 {
+		itr.pos = itr.infos[0].Pos()
+		return true
+	}
 
-		// Read segments into a cache for the current index.
-		index := itr.indexes[0]
-		itr.indexes = itr.indexes[1:]
-		f, err := os.Open(filepath.Join(itr.db.ShadowWALDir(itr.generation), FormatIndex(index)))
-		if err != nil {
+	// Determine index to begin reading from. Use the index of the last read
+	// position or, if no position read yet, find the lowest index in shadow WAL.
+	index := itr.pos.Index
+	if itr.pos.IsZero() {
+		var err error
+		if index, err = minWALDirIndex(itr.db.ShadowWALDir(itr.generation)); err == errNoShadowWALEntries {
+			return false // no index directories in shadow WAL
+		} else if err != nil {
 			itr.err = err
 			return false
-		}
-		defer func() { _ = f.Close() }()
-
-		fis, err := f.Readdir(-1)
-		if err != nil {
-			itr.err = err
-			return false
-		} else if err := f.Close(); err != nil {
-			itr.err = err
-			return false
-		}
-		for _, fi := range fis {
-			filename := filepath.Base(fi.Name())
-			if fi.IsDir() {
-				continue
-			}
-
-			offset, err := ParseOffset(strings.TrimSuffix(filename, ".wal.lz4"))
-			if err != nil {
-				continue
-			}
-
-			itr.infos = append(itr.infos, WALSegmentInfo{
-				Generation: itr.generation,
-				Index:      index,
-				Offset:     offset,
-				Size:       fi.Size(),
-				CreatedAt:  fi.ModTime().UTC(),
-			})
-		}
-
-		// Ensure segments are sorted within index.
-		sort.Sort(WALSegmentInfoSlice(itr.infos))
-
-		if len(itr.infos) > 0 {
-			return true
 		}
 	}
+
+	// If no segments remain, check for new segments in the current index.
+	if err := itr.checkNewSegments(index); err != nil {
+		itr.err = err
+		return false
+	} else if len(itr.infos) > 0 {
+		itr.pos = itr.infos[0].Pos()
+		return true
+	}
+
+	// TODO: Fix race condition where segments can be added to old index and new index.
+	// Either obtain a lock when reading segments or check if new index exists before checking old segments?
+
+	// If no segments remain, check for new segments in the current index.
+	if err := itr.checkNewSegments(index + 1); err != nil && !os.IsNotExist(err) {
+		itr.err = err
+		return false
+	} else if len(itr.infos) > 0 {
+		itr.pos = itr.infos[0].Pos()
+		return true
+	}
+	return false
+}
+
+func (itr *shadowWALSegmentIterator) checkNewSegments(index int) error {
+	// Read segments into a cache for the current index.
+	ents, err := os.ReadDir(filepath.Join(itr.db.ShadowWALDir(itr.generation), FormatIndex(index)))
+	if err != nil {
+		return err
+	}
+
+	var infos []WALSegmentInfo
+	for _, ent := range ents {
+		filename := ent.Name()
+		if ent.IsDir() {
+			continue
+		}
+
+		offset, err := ParseOffset(strings.TrimSuffix(filename, ".wal.lz4"))
+		if err != nil {
+			continue
+		}
+
+		fi, err := ent.Info()
+		if err != nil {
+			return err
+		}
+
+		info := WALSegmentInfo{
+			Generation: itr.generation,
+			Index:      index,
+			Offset:     offset,
+			Size:       fi.Size(),
+			CreatedAt:  fi.ModTime().UTC(),
+		}
+
+		// Ensure this segment occurs after our last read.
+		if !itr.pos.IsZero() {
+			if cmp, err := ComparePos(itr.pos, info.Pos()); err != nil {
+				return err
+			} else if cmp != -1 {
+				continue
+			}
+		}
+
+		infos = append(infos, info)
+	}
+
+	// Ensure segments are sorted within index.
+	itr.infos = append(itr.infos, infos...)
+	sort.Sort(WALSegmentInfoSlice(itr.infos))
+
+	return nil
 }
 
 func (itr *shadowWALSegmentIterator) Err() error { return itr.err }
@@ -1397,6 +1415,64 @@ func (itr *shadowWALSegmentIterator) WALSegment() WALSegmentInfo {
 		return WALSegmentInfo{}
 	}
 	return itr.infos[0]
+}
+
+var errNoShadowWALEntries = errors.New("no shadow wal entries available")
+
+// minWALDirIndex returns the lowest WAL directory index that has segments.
+func minWALDirIndex(dir string) (int, error) {
+	ents, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return 0, errNoShadowWALEntries
+	} else if err != nil {
+		return 0, err
+	}
+
+	min := -1
+	for _, ent := range ents {
+		index, err := ParseIndex(ent.Name())
+		if err != nil {
+			continue
+		}
+
+		// Ensure index directory has at least one segment file.
+		if ok, err := walIndexDirHasSegments(filepath.Join(dir, ent.Name())); err != nil {
+			return 0, err
+		} else if !ok {
+			continue
+		}
+
+		if min == -1 || index < min {
+			min = index
+		}
+	}
+
+	if min == -1 {
+		return 0, errNoShadowWALEntries
+	}
+	return min, nil
+}
+
+// walIndexDirHasSegments returns true if the directory has at least one WAL segment file.
+func walIndexDirHasSegments(dir string) (bool, error) {
+	ents, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+
+	for _, ent := range ents {
+		filename := filepath.Base(ent.Name())
+		if ent.IsDir() {
+			continue
+		} else if _, err := ParseOffset(strings.TrimSuffix(filename, ".wal.lz4")); err != nil {
+			continue
+		}
+		return true, nil
+	}
+
+	return false, nil
 }
 
 // frameAlign returns a frame-aligned offset.

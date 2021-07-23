@@ -5,9 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net"
-	"net/http"
-	_ "net/http/pprof"
 	"os"
 	"os/exec"
 
@@ -15,16 +12,17 @@ import (
 	"github.com/benbjohnson/litestream/abs"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gcs"
+	"github.com/benbjohnson/litestream/http"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
 	"github.com/mattn/go-shellwords"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // ReplicateCommand represents a command that continuously replicates SQLite databases.
 type ReplicateCommand struct {
-	cmd    *exec.Cmd  // subcommand
-	execCh chan error // subcommand error channel
+	cmd        *exec.Cmd  // subcommand
+	execCh     chan error // subcommand error channel
+	httpServer *http.Server
 
 	Config Config
 
@@ -126,22 +124,15 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		}
 	}
 
-	// Serve metrics over HTTP if enabled.
+	// Run HTTP server, if enabled.
 	if c.Config.Addr != "" {
-		hostport := c.Config.Addr
-		if host, port, _ := net.SplitHostPort(c.Config.Addr); port == "" {
-			return fmt.Errorf("must specify port for bind address: %q", c.Config.Addr)
-		} else if host == "" {
-			hostport = net.JoinHostPort("localhost", port)
+		c.httpServer = http.NewServer(c.Config.Addr)
+		c.httpServer.DB = c.DBs[0] // TEMP: Refactor to use any database
+		if err := c.httpServer.Open(); err != nil {
+			return fmt.Errorf("cannot start http server: %w", err)
 		}
 
-		log.Printf("serving metrics on http://%s/metrics", hostport)
-		go func() {
-			http.Handle("/metrics", promhttp.Handler())
-			if err := http.ListenAndServe(c.Config.Addr, nil); err != nil {
-				log.Printf("cannot start metrics server: %s", err)
-			}
-		}()
+		log.Printf("serving http requests on %s", c.httpServer.URL())
 	}
 
 	// Parse exec commands args & start subprocess.
@@ -166,6 +157,12 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 
 // Close closes all open databases.
 func (c *ReplicateCommand) Close() (err error) {
+	if c.httpServer != nil {
+		if e := c.httpServer.Close(); e != nil && err == nil {
+			err = e
+		}
+	}
+
 	for _, db := range c.DBs {
 		if e := db.SoftClose(); e != nil {
 			log.Printf("error closing db: path=%s err=%s", db.Path(), e)
