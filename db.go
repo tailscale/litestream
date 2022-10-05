@@ -72,6 +72,10 @@ type DB struct {
 	checkpointErrorNCounterVec  *prometheus.CounterVec
 	checkpointSecondsCounterVec *prometheus.CounterVec
 
+	lastCheckpointSecondsGauge *prometheus.GaugeVec
+	lastFramesCheckpointed     *prometheus.GaugeVec
+	lastWALFrames              prometheus.Gauge
+
 	// Minimum threshold of WAL size, in pages, before a passive checkpoint.
 	// A passive checkpoint will attempt a checkpoint but fail if there are
 	// active transactions occurring at the same time.
@@ -121,6 +125,10 @@ func NewDB(path string) *DB {
 	db.checkpointNCounterVec = checkpointNCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
 	db.checkpointErrorNCounterVec = checkpointErrorNCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
 	db.checkpointSecondsCounterVec = checkpointSecondsCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
+
+	db.lastCheckpointSecondsGauge = lastCheckpointSecondsGauge.MustCurryWith(prometheus.Labels{"db": db.path})
+	db.lastFramesCheckpointed = lastFramesCheckpointed.MustCurryWith(prometheus.Labels{"db": db.path})
+	db.lastWALFrames = lastWALFrames.WithLabelValues(db.path)
 
 	db.ctx, db.cancel = context.WithCancel(context.Background())
 
@@ -1334,16 +1342,17 @@ func (db *DB) execCheckpoint(mode string) (err error) {
 	if db.db == nil {
 		return nil
 	}
+	labels := prometheus.Labels{"mode": mode}
 
 	// Track checkpoint metrics.
 	t := time.Now()
 	defer func() {
-		labels := prometheus.Labels{"mode": mode}
 		db.checkpointNCounterVec.With(labels).Inc()
 		if err != nil {
 			db.checkpointErrorNCounterVec.With(labels).Inc()
 		}
 		db.checkpointSecondsCounterVec.With(labels).Add(float64(time.Since(t).Seconds()))
+		db.lastCheckpointSecondsGauge.With(labels).Set(float64(time.Since(t).Seconds()))
 	}()
 
 	// Ensure the read lock has been removed before issuing a checkpoint.
@@ -1366,6 +1375,10 @@ func (db *DB) execCheckpoint(mode string) (err error) {
 		return err
 	}
 	Tracef("%s: checkpoint: mode=%v (%d,%d,%d)", db.path, mode, row[0], row[1], row[2])
+
+	frames, framesCheckpointed := row[1], row[2]
+	db.lastWALFrames.Set(float64(frames))
+	db.lastFramesCheckpointed.With(labels).Set(float64(framesCheckpointed))
 
 	// Reacquire the read lock immediately after the checkpoint.
 	if err := db.acquireReadLock(); err != nil {
@@ -1591,6 +1604,21 @@ var (
 		Name: "litestream_checkpoint_seconds",
 		Help: "Time spent checkpointing WAL, in seconds",
 	}, []string{"db", "mode"})
+
+	lastCheckpointSecondsGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "litestream_checkpoint_seconds_last",
+		Help: "Time spent during the last checkpoint, in seconds",
+	}, []string{"db", "mode"})
+
+	lastFramesCheckpointed = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "litestream_checkpoint_frames_last",
+		Help: "Number of frames moved in the last checkpoint, in seconds",
+	}, []string{"db", "mode"})
+
+	lastWALFrames = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "litestream_wal_frames_last",
+		Help: "Number of frames in the WAL file at the last checkpoint",
+	}, []string{"db"})
 )
 
 func headerByteOrder(hdr []byte) (binary.ByteOrder, error) {
