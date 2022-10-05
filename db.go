@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -23,6 +24,7 @@ import (
 	"github.com/benbjohnson/litestream/internal"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/tailscale/sqlite"
 )
 
 // Default DB settings.
@@ -366,6 +368,25 @@ func (db *DB) UpdatedAt() (time.Time, error) {
 	return t, nil
 }
 
+func (db *DB) openDB(ctx context.Context) error {
+	connInitFunc := func(ctx context.Context, conn driver.ConnPrepareContext) error {
+		c := conn.(sqlite.SQLConn)
+		return sqlite.ExecScript(c, `
+			PRAGMA busy_timeout=1000;
+			PRAGMA journal_mode=WAL;
+			PRAGMA wal_autocheckpoint=0;
+		`)
+	}
+	sdb := sql.OpenDB(sqlite.Connector(db.path, connInitFunc, nil))
+	conn, err := sdb.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("sqliteOpen: %w", err)
+	}
+	conn.Close()
+	db.db = sdb
+	return nil
+}
+
 // init initializes the connection to the database.
 // Skipped if already initialized or if the database file does not exist.
 func (db *DB) init() (err error) {
@@ -389,11 +410,8 @@ func (db *DB) init() (err error) {
 	}
 	db.dirInfo = fi
 
-	dsn := db.path
-	dsn += fmt.Sprintf("?_busy_timeout=%d", BusyTimeout.Milliseconds())
-
 	// Connect to SQLite database.
-	if db.db, err = sql.Open("sqlite3", dsn); err != nil {
+	if err := db.openDB(context.Background()); err != nil {
 		return err
 	}
 
@@ -420,11 +438,6 @@ func (db *DB) init() (err error) {
 		return err
 	} else if mode != "wal" {
 		return fmt.Errorf("enable wal failed, mode=%q", mode)
-	}
-
-	// Disable autocheckpoint for litestream's connection.
-	if _, err := db.db.ExecContext(db.ctx, `PRAGMA wal_autocheckpoint = 0;`); err != nil {
-		return fmt.Errorf("disable autocheckpoint: %w", err)
 	}
 
 	// Create a table to force writes to the WAL when empty.
@@ -601,7 +614,7 @@ func (db *DB) acquireReadLock() error {
 	}
 
 	// Start long running read-transaction to prevent checkpoints.
-	tx, err := db.db.Begin()
+	tx, err := db.db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return err
 	}

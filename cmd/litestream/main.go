@@ -23,7 +23,7 @@ import (
 	"github.com/benbjohnson/litestream/gcs"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/tailscale/sqlite"
 	"gopkg.in/yaml.v2"
 )
 
